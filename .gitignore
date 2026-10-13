@@ -1,0 +1,4 @@
+.build/
+.swiftpm/
+Moria.app/
+.DS_Store
