@@ -1,0 +1,16 @@
+This is a Moria vault. Each file in it is encrypted with Apple's own format, so you can get your files back without
+Moria, on any Mac.
+
+The easy way: double-click Recover, enter the vault's password, and choose where the files should go. If macOS
+won't open it, right-click it and choose Open.
+
+In Terminal, from this folder:
+
+    read kdf rounds salt < key.kdf
+    secret=$(printf %s 'YOUR PASSWORD' | openssl enc -aes-256-cbc -pbkdf2 -md sha256 -iter $rounds -S $salt -pass stdin -P | sed -n 's/^key=//p')
+    key=$(aea decrypt -i key.aea -o /dev/stdout -password-value $secret | base64)
+    mkdir ~/Desktop/Recovered
+    for f in files/*.aea; do aa extract -i "$f" -d ~/Desktop/Recovered -key-value "base64:$key"; done
+
+How it works: files/ holds one Apple Encrypted Archive per file or folder, recording its path. key.aea holds the
+key they're encrypted with, itself encrypted with your password as stretched by the PBKDF2 settings in key.kdf.

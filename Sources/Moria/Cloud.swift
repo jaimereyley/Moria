@@ -30,6 +30,7 @@ enum GCloud {
             let id = "gs://\(bucket)/\(fields[0][..<slash])"
             backups[id, default: Backup(id: id)].size += Int(fields[1]) ?? 0
             backups[id]!.date = max(backups[id]!.date, Date(timeIntervalSince1970: Double(fields[2]) ?? 0))
+            if fields[0].contains("/bands/") { backups[id]!.legacy = true }
         }
         return backups.values.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
     }
@@ -40,6 +41,7 @@ struct Backup: Identifiable {
     let id: String  // gs://moria-…/Name-1a2b3c
     var size = 0
     var date = Date.distantPast
+    var legacy = false  // A disk image from Moria's first version, which this one can't open.
     /// Without the suffix that keeps two vaults of the same name apart.
     var name: String { String(id.split(separator: "/").last ?? "").replacing(#/-[0-9a-f]{6}$/#, with: "") }
 }
@@ -126,6 +128,7 @@ struct CloudSheet: View {
             HStack {
                 if backup.id == vault.remote { Text("This vault").foregroundStyle(.ithildin) }
                 else if elsewhere[backup.id] != nil { Text("On this Mac").foregroundStyle(.secondary) }
+                else if backup.legacy { Text("Old format").foregroundStyle(.secondary) }
                 else { Button("Restore…") { restore(backup) } }
                 Button("Delete", systemImage: "trash", role: .destructive) { doomed = backup }.labelStyle(.iconOnly).buttonStyle(.borderless)
             }
@@ -169,7 +172,7 @@ struct CloudSheet: View {
         guard let url = pickVault(NSSavePanel(), name: backup.name) else { return }
         guard !FileManager.default.fileExists(atPath: url.path) else { return error = "Restoring never overwrites a vault. Choose a new name." }
         perform {
-            try await GCloud.run("storage", "rsync", "-r", backup.id, url.path)
+            try await GCloud.run("storage", "rsync", "-r", "-P", backup.id, url.path)
             vault.restored(url, from: backup.id)
             dismiss()
         }

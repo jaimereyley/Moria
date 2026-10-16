@@ -1,13 +1,21 @@
+import AVKit
+import PDFKit
 import SwiftUI
 import UniformTypeIdentifiers
 
 @main struct Moria: App {
-    @State private var vault = Vault()
+    @NSApplicationDelegateAdaptor private var app: AppDelegate
 
     var body: some Scene {
-        Window("Moria", id: "vault") { ContentView(vault: vault) }  // Sole Window scene: closing it quits, which locks.
+        Window("Moria", id: "vault") { ContentView(vault: app.vault) }  // Sole Window scene: closing it quits, which locks.
             .defaultSize(width: 920, height: 580)
     }
+}
+
+/// Opens vaults double-clicked in Finder.
+@MainActor final class AppDelegate: NSObject, NSApplicationDelegate {
+    let vault = Vault()
+    func application(_ application: NSApplication, open urls: [URL]) { vault.bundle = urls.first ?? vault.bundle }
 }
 
 extension ShapeStyle where Self == Color {
@@ -41,7 +49,7 @@ struct ContentView: View {
             Sidebar(vault: vault)
         } detail: {
             Group {
-                if let mount = vault.mount { Browser(vault: vault, root: mount) } else { LockScreen(vault: vault) }
+                if vault.store != nil { Browser(vault: vault) } else { LockScreen(vault: vault) }
             }
             .toolbar {
                 ToolbarSpacer(.flexible)
@@ -71,7 +79,7 @@ struct Sidebar: View {
                                 .font(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
                         }
                     } icon: {
-                        Image(systemName: vault.mount != nil && path == vault.bundle?.path ? "lock.open.fill" : "lock.fill")
+                        Image(systemName: vault.store != nil && path == vault.bundle?.path ? "lock.open.fill" : "lock.fill")
                     }
                     .contextMenu {
                         Button("Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting([URL(filePath: path)]) }
@@ -95,9 +103,17 @@ struct Sidebar: View {
 
 /// Asks where a vault is, or should go. Save panels suggest `name`.
 @MainActor func pickVault(_ panel: NSSavePanel, name: String = "") -> URL? {
-    panel.allowedContentTypes = [UTType(filenameExtension: "sparsebundle")!]
+    panel.allowedContentTypes = [UTType(filenameExtension: "moria", conformingTo: .package)!]
     panel.nameFieldStringValue = name
     return panel.runModal() == .OK ? panel.url.map { URL(filePath: $0.path) } : nil
+}
+
+/// Asks where to export to, warning that exported copies aren't encrypted.
+@MainActor func pickExportFolder() -> URL? {
+    let panel = NSOpenPanel()
+    (panel.canChooseDirectories, panel.canChooseFiles, panel.prompt) = (true, false, "Export")
+    panel.message = "Exported copies aren't encrypted."
+    return panel.runModal() == .OK ? panel.url : nil
 }
 
 /// The Doors of Durin, glowing in ithildin.
@@ -134,19 +150,22 @@ struct LockScreen: View {
             } else {
                 let creating = !vault.exists
                 Text(vault.name).font(.largeTitle.weight(.semibold))
-                if creating { Text("Choose its password. Nobody can recover it for you.").foregroundStyle(.secondary) }
+                if creating {
+                    Text("Choose a password of 8 characters or more. Longer is safer, and with Touch ID you'll rarely type it. Nobody can recover it for you.")
+                        .foregroundStyle(.secondary).multilineTextAlignment(.center).fixedSize(horizontal: false, vertical: true)
+                }
                 else { BackupStatus(vault: vault) }
                 SecureField(creating ? "Password" : "Speak, friend, and enter", text: $password).padding(.top, 8)
                 if creating { SecureField("Confirm Password", text: $confirm) }
                 Toggle("Remember with Touch ID", isOn: $touchID)
                 HStack {
-                    if !creating && vault.hasSavedPassword {
+                    if !creating && vault.hasSavedSecret {
                         Button("Touch ID", systemImage: "touchid") { Task { await vault.unlockWithTouchID() } }
                     }
                     Button(creating ? "Create Vault" : "Unlock", action: submit)
                         .buttonStyle(Glowing())
                         .keyboardShortcut(.defaultAction)
-                        .disabled(password.isEmpty || creating && password != confirm)
+                        .disabled(password.isEmpty || creating && (password.count < 8 || password != confirm))
                 }
             }
         }
@@ -170,53 +189,39 @@ struct LockScreen: View {
     }
 }
 
-struct Item: Identifiable {
-    static let keys: Set<URLResourceKey> = [.isDirectoryKey, .isPackageKey, .contentModificationDateKey, .fileSizeKey, .localizedTypeDescriptionKey]
-    let url: URL, name: String, kind: String, date: Date, size: Int, isFolder: Bool, icon: NSImage
-    var id: URL { url }
-
-    init(_ url: URL) {
-        let values = try? url.resourceValues(forKeys: Item.keys)
-        (self.url, name, icon) = (url, url.lastPathComponent, NSWorkspace.shared.icon(forFile: url.path))
-        kind = values?.localizedTypeDescription ?? ""
-        date = values?.contentModificationDate ?? .distantPast
-        size = values?.fileSize ?? 0
-        isFolder = values?.isDirectory == true && values?.isPackage != true
-    }
-}
-
 struct Browser: View {
     let vault: Vault
-    let root: URL
-    @State private var path: [String] = []
-    @State private var items: [Item] = []
-    @State private var selection = Set<URL>()
-    @State private var order = [KeyPathComparator(\Item.name)]
-    @State private var renaming: URL?
+    @State private var folder = ""  // The folder shown, as a path in the vault.
+    @State private var selection = Set<String>()
+    @State private var order = [KeyPathComparator(\Entry.name)]
+    @State private var renaming: String?
     @State private var newName = ""
-    @State private var doomed: Set<URL>?
-    @State private var working = 0
+    @State private var doomed: Set<String>?
+    @State private var viewing: Entry?
     @State private var targeted = false
 
-    private var dir: URL { path.reduce(root) { $0.appending(path: $1) } }
+    private var items: [Entry] { vault.children(of: folder).filter { !(folder.isEmpty && Browser.obsidian.contains($0.name)) }.sorted(using: order) }
+    private static let obsidian: Set = [".obsidian", ".trash"]  // Obsidian's settings and deleted notes.
+    /// While Obsidian edits the vault, Moria only views it, so their changes never cross.
+    private var viewOnly: Bool { vault.obsidian != nil }
 
     var body: some View {
-        Table(of: Item.self, selection: $selection, sortOrder: $order) {
-            TableColumn("Name", value: \.name) { item in
-                Label { Text(item.name) } icon: { Image(nsImage: item.icon).resizable().frame(width: 16, height: 16) }
+        let items = items
+        Table(items, selection: $selection, sortOrder: $order) {
+            TableColumn("Name", value: \.name) { entry in
+                Label { Text(entry.name) } icon: { Image(nsImage: NSWorkspace.shared.icon(for: entry.type)).resizable().frame(width: 16, height: 16) }
             }
             TableColumn("Date Modified", value: \.date) { Text($0.date, format: .dateTime) }
             TableColumn("Size", value: \.size) { Text($0.isFolder ? "--" : $0.size.formatted(.byteCount(style: .file))) }
             TableColumn("Kind", value: \.kind)
-        } rows: {
-            ForEach(items) { item in TableRow(item).itemProvider { NSItemProvider(contentsOf: item.url) } }
         }
-        .contextMenu(forSelectionType: URL.self) { urls in
-            Button("Open") { open(urls) }
-            Button("Rename…") { rename(urls.first) }.disabled(urls.count != 1)
-            Button("Delete…") { doomed = urls }
+        .contextMenu(forSelectionType: String.self) { paths in
+            Button("Open") { open(paths) }
+            Button("Export…") { if let folder = pickExportFolder() { vault.export(paths, to: folder) } }
+            Button("Rename…") { rename(paths.first) }.disabled(paths.count != 1 || viewOnly)
+            Button("Delete…") { doomed = paths }.disabled(viewOnly)
         } primaryAction: { open($0) }
-        .onDeleteCommand { if !selection.isEmpty { doomed = selection } }
+        .onDeleteCommand { if !selection.isEmpty && !viewOnly { doomed = selection } }
         .tableStyle(.inset(alternatesRowBackgrounds: false))
         .overlay {
             if items.isEmpty {
@@ -228,7 +233,23 @@ struct Browser: View {
             }
         }
         .overlay { if targeted { RoundedRectangle(cornerRadius: 12).strokeBorder(.ithildin, lineWidth: 2).padding(6) } }
-        .dropDestination(for: URL.self) { urls, _ in add(urls); return true } isTargeted: { targeted = $0 }
+        .dropDestination(for: URL.self) { urls, _ in
+            guard !viewOnly else { return false }
+            vault.add(urls, to: folder, move: NSEvent.modifierFlags.contains(.command))
+            return true
+        } isTargeted: { targeted = $0 && !viewOnly }
+        .safeAreaInset(edge: .top, spacing: 0) {
+            if viewOnly {
+                HStack {
+                    Label("Open in Obsidian. Until you close it, any app on this Mac can read these files.", systemImage: "lock.open.trianglebadge.exclamationmark")
+                    Spacer()
+                    Button("Close Obsidian", action: vault.closeObsidian)
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 8)
+                .background(.ithildin.opacity(0.15))
+            }
+        }
         .safeAreaInset(edge: .bottom, spacing: 0) {
             HStack {
                 BackupStatus(vault: vault)
@@ -242,85 +263,179 @@ struct Browser: View {
             .overlay(alignment: .top) { Divider() }
         }
         .navigationTitle(vault.name)
-        .navigationSubtitle(path.joined(separator: " › "))
+        .navigationSubtitle(folder.split(separator: "/").joined(separator: " › "))
         .toolbar {
             ToolbarItem(placement: .navigation) {
-                Button("Back", systemImage: "chevron.left") { path.removeLast() }
-                    .keyboardShortcut(.upArrow).disabled(path.isEmpty)
+                Button("Back", systemImage: "chevron.left") { folder = (folder as NSString).deletingLastPathComponent }
+                    .keyboardShortcut(.upArrow).disabled(folder.isEmpty)
             }
             ToolbarItemGroup {
-                if working > 0 { ProgressView().controlSize(.small) }
-                Button("New Folder", systemImage: "folder.badge.plus", action: newFolder).keyboardShortcut("n", modifiers: [.command, .shift])
+                if vault.working > 0 { ProgressView().controlSize(.small) }
+                Button("New Folder", systemImage: "folder.badge.plus") { rename(vault.newFolder(in: folder)) }
+                    .keyboardShortcut("n", modifiers: [.command, .shift]).disabled(viewOnly)
+                if let obsidian = Obsidian.app {
+                    Button { Task { await vault.openInObsidian() } } label: {
+                        Label { Text("Open in Obsidian") } icon: { Image(nsImage: NSWorkspace.shared.icon(forFile: obsidian.path)).resizable().frame(width: 20, height: 20) }
+                    }
+                    .help("Open this vault in Obsidian. Until Obsidian closes, any app on this Mac can read its files.")
+                }
                 Button("Lock", systemImage: "lock", action: vault.lock).keyboardShortcut("l")
             }
         }
-        .onChange(of: path, initial: true) { load() }
-        .onChange(of: order) { items.sort(using: order) }
-        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in load() }
-        .alert("Rename", isPresented: Binding(isPresent: $renaming), presenting: renaming) { url in
+        .onChange(of: folder) { selection = [] }
+        .sheet(item: $viewing) { Viewer(vault: vault, entry: $0) }
+        .alert("Rename", isPresented: Binding(isPresent: $renaming), presenting: renaming) { path in
             TextField("Name", text: $newName)
-            Button("Rename") {
-                let name = newName
-                attempt { try FileManager.default.moveItem(at: url, to: url.deletingLastPathComponent().appending(path: name)) }
-            }
+            Button("Rename") { vault.rename(path, to: newName) }
             Button("Cancel", role: .cancel) {}
         }
-        .confirmationDialog("Permanently delete \(doomed?.count ?? 0) item(s)?", isPresented: Binding(isPresent: $doomed), presenting: doomed) { urls in
-            Button("Delete", role: .destructive) { attempt { for url in urls { try FileManager.default.removeItem(at: url) } } }
+        .confirmationDialog("Permanently delete \(doomed?.count ?? 0) item(s)?", isPresented: Binding(isPresent: $doomed), presenting: doomed) { paths in
+            Button("Delete", role: .destructive) { vault.delete(paths) }
         }
     }
 
-    private func load() {
-        let urls = (try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: Array(Item.keys), options: .skipsHiddenFiles)) ?? []
-        items = urls.map(Item.init).sorted(using: order)
+    private func open(_ paths: Set<String>) {
+        guard let entry = paths.first.flatMap({ vault.entries[$0] }) else { return }
+        if entry.isFolder { folder = entry.path } else { viewing = entry }
     }
 
-    private func open(_ urls: Set<URL>) {
-        for item in items where urls.contains(item.url) {
-            if item.isFolder { path.append(item.name); return }
-            NSWorkspace.shared.open(item.url)
-        }
+    private func rename(_ path: String?) { (newName, renaming) = (path.map { ($0 as NSString).lastPathComponent } ?? "", path) }
+}
+
+/// Shows a file straight from memory, so it's never written anywhere unencrypted.
+struct Viewer: View {
+    let vault: Vault
+    let entry: Entry
+    @Environment(\.dismiss) private var dismiss
+    @State private var shown: Shown?
+
+    /// What a file shows as, built once from its decrypted bytes.
+    enum Shown {
+        case pdf(PDFDocument), image(NSImage), media(MemoryMedia), text(NSAttributedString, paper: Bool), message(String, String)
     }
 
-    /// Copies dropped files in; ⌘-drop moves them, so only the encrypted copy remains.
-    private func add(_ urls: [URL]) {
-        let move = NSEvent.modifierFlags.contains(.command), dir = dir
-        attempt {
-            for url in urls where url.deletingLastPathComponent().path != dir.path {
-                let destination = unique(dir.appending(path: url.lastPathComponent))
-                try move ? FileManager.default.moveItem(at: url, to: destination) : FileManager.default.copyItem(at: url, to: destination)
+    /// Documents AppKit's text system reads, with their formatting.
+    private static let documents: [String: NSAttributedString.DocumentType] = [
+        UTType.rtf.identifier: .rtf, "com.microsoft.word.doc": .docFormat,
+        "org.openxmlformats.wordprocessingml.document": .officeOpenXML, "org.oasis-open.opendocument.text": .openDocument,
+    ]
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Group {
+                switch shown {
+                case .pdf(let document): PDFReader(document: document)
+                case .image(let image): Image(nsImage: image).resizable().scaledToFit().padding()
+                case .media(let media): MediaPlayer(player: media.player)
+                case .text(let text, let paper): TextReader(text: text, paper: paper)
+                case .message(let title, let detail): ContentUnavailableView(title, systemImage: "eye.slash", description: Text(detail))
+                case nil: ProgressView()
+                }
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            HStack {
+                Label { Text(entry.name).fontWeight(.semibold) } icon: { Image(nsImage: NSWorkspace.shared.icon(for: entry.type)) }
+                Spacer()
+                Button("Export…") { if let folder = pickExportFolder() { vault.export([entry.path], to: folder) } }
+                Button("Done") { dismiss() }.keyboardShortcut(.cancelAction)
+            }
+            .padding(16)
+            .overlay(alignment: .top) { Divider() }
         }
+        .frame(minWidth: 760, minHeight: 540)
+        .task { shown = await show() }
     }
 
-    private func newFolder() {
-        let folder = unique(dir.appending(path: "untitled folder"))
-        attempt { try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false) }
-        rename(folder)
-    }
-
-    private func rename(_ url: URL?) { (newName, renaming) = (url?.lastPathComponent ?? "", url) }
-
-    /// Runs file work off the main thread, then refreshes.
-    private func attempt(_ work: @escaping @Sendable () throws -> Void) {
-        working += 1
-        Task {
-            do { try await Task.detached { try work() }.value } catch { vault.error = error.localizedDescription }
-            working -= 1
-            load()
+    private func show() async -> Shown {
+        let type = entry.type, document = Viewer.documents[type.identifier]
+        guard document != nil || [.pdf, .image, .audiovisualContent, .text].contains(where: type.conforms) else {
+            return .message("Moria can't show this kind of file yet", "Export it to open it in another app. The exported copy isn't encrypted.")
+        }
+        do {
+            let data = try await vault.contents(of: entry)
+            if type.conforms(to: .pdf), let pdf = PDFDocument(data: data) { return .pdf(pdf) }
+            if type.conforms(to: .image), let image = NSImage(data: data) { return .image(image) }
+            if type.conforms(to: .audiovisualContent) { return .media(MemoryMedia(data, type: type)) }
+            if let document, let text = try? NSAttributedString(data: data, options: [.documentType: document], documentAttributes: nil) {
+                return .text(text, paper: true)
+            }
+            if let text = String(data: data, encoding: .utf8) {
+                return .text(NSAttributedString(string: text, attributes: [.font: NSFont.monospacedSystemFont(ofSize: 13, weight: .regular),
+                                                                           .foregroundColor: NSColor.textColor]), paper: false)
+            }
+            return .message("Moria couldn't read “\(entry.name)”", "It may be damaged. Try exporting it.")
+        } catch {
+            return .message("Couldn't decrypt “\(entry.name)”", error.localizedDescription)
         }
     }
 }
 
-/// `name 2.ext`, `name 3.ext`… like Finder, so nothing is ever overwritten.
-func unique(_ url: URL) -> URL {
-    let base = url.deletingPathExtension().lastPathComponent, ext = url.pathExtension.isEmpty ? "" : "." + url.pathExtension
-    var candidate = url, n = 1
-    while FileManager.default.fileExists(atPath: candidate.path) {
-        n += 1
-        candidate = url.deletingLastPathComponent().appending(path: "\(base) \(n)\(ext)")
+struct PDFReader: NSViewRepresentable {
+    let document: PDFDocument
+
+    func makeNSView(context: Context) -> PDFView {
+        let view = PDFView()
+        (view.autoScales, view.document) = (true, document)
+        return view
     }
-    return candidate
+
+    func updateNSView(_ view: PDFView, context: Context) {}
+}
+
+/// Read-only, selectable text: plain, or a document's own formatting on white paper.
+struct TextReader: NSViewRepresentable {
+    let text: NSAttributedString
+    let paper: Bool
+
+    func makeNSView(context: Context) -> NSScrollView {
+        let scroll = NSTextView.scrollableTextView()
+        let view = scroll.documentView as! NSTextView
+        (view.isEditable, view.textContainerInset) = (false, NSSize(width: 24, height: 20))
+        if paper { view.appearance = NSAppearance(named: .aqua) }  // Documents expect black ink on white.
+        view.textStorage?.setAttributedString(text)
+        return scroll
+    }
+
+    func updateNSView(_ view: NSScrollView, context: Context) {}
+}
+
+struct MediaPlayer: NSViewRepresentable {
+    let player: AVPlayer
+
+    func makeNSView(context: Context) -> AVPlayerView {
+        let view = AVPlayerView()
+        view.player = player
+        return view
+    }
+
+    func updateNSView(_ view: AVPlayerView, context: Context) {}
+}
+
+/// Plays audio or video from memory, handing AVFoundation the decrypted bytes through a URL only this player knows.
+final class MemoryMedia: NSObject, AVAssetResourceLoaderDelegate {
+    private let data: Data, type: UTType
+    private(set) var player = AVPlayer()
+
+    init(_ data: Data, type: UTType) {
+        (self.data, self.type) = (data, type)
+        super.init()
+        let asset = AVURLAsset(url: URL(string: "moria://media")!)
+        asset.resourceLoader.setDelegate(self, queue: .main)
+        player = AVPlayer(playerItem: AVPlayerItem(asset: asset))
+    }
+
+    func resourceLoader(_ loader: AVAssetResourceLoader, shouldWaitForLoadingOfRequestedResource request: AVAssetResourceLoadingRequest) -> Bool {
+        if let info = request.contentInformationRequest {
+            (info.contentType, info.contentLength, info.isByteRangeAccessSupported) = (type.identifier, Int64(data.count), true)
+        }
+        if let wanted = request.dataRequest {
+            let start = Int(wanted.requestedOffset)
+            let end = wanted.requestsAllDataToEndOfResource ? data.count : min(data.count, start + wanted.requestedLength)
+            wanted.respond(with: data.subdata(in: start..<end))
+        }
+        request.finishLoading()
+        return true
+    }
 }
 
 extension Binding where Value == Bool {
